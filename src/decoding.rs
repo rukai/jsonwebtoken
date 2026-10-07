@@ -14,7 +14,7 @@ use crate::pem::decoder::PemEncodedKey;
 use crate::serialization::{DecodedJwtPartClaims, b64_decode};
 use crate::validation::{Validation, validate};
 
-/// The return type of a successful call to [decode](fn.decode.html).
+/// The return type of a successful call to [decode] or [decode_by_kid].
 #[derive(Debug)]
 pub struct TokenData<T> {
     /// The decoded JWT header
@@ -276,6 +276,61 @@ pub fn decode<T: DeserializeOwned>(
     let (signature, message) = expect_two!(token.rsplitn(2, |b| *b == b'.'));
     let (payload, header) = expect_two!(message.rsplitn(2, |b| *b == b'.'));
     let header = Header::from_encoded(header)?;
+
+    if !validation.algorithms.contains(&header.alg) {
+        return Err(new_error(ErrorKind::InvalidAlgorithm));
+    }
+
+    let verifying_provider = (CryptoProvider::get_default().verifier_factory)(&header.alg, key)?;
+
+    verify_signature_body(message, signature, &header, validation, verifying_provider)?;
+
+    let decoded_claims = DecodedJwtPartClaims::from_jwt_part_claims(payload)?;
+    let claims = decoded_claims.deserialize()?;
+    validate(decoded_claims.deserialize()?, validation)?;
+
+    Ok(TokenData { header, claims })
+}
+
+/// Decode and validate a JWT using the key identified by its header's `kid` field.
+///
+/// Calls `key_for_kid` once with the header's `kid`, or `None` if it is absent,
+/// allowing the callback to select a default key. The signature and claims are
+/// then validated using `validation`, as in [decode].
+///
+/// Returns [`ErrorKind::InvalidToken`] if the callback returns `None`.
+/// Other decoding and validation errors are returned as usual.
+///
+/// ```rust
+/// use std::collections::HashMap;
+/// use jsonwebtoken::{decode_by_kid, DecodingKey, Validation};
+/// use serde::Deserialize;
+///
+/// #[derive(Debug, Deserialize)]
+/// struct Claims {
+///     sub: String,
+///     exp: u64,
+/// }
+///
+/// let keys = HashMap::from([("key-1".to_string(), DecodingKey::from_secret(b"secret"))]);
+/// let token = "a.jwt.token";
+/// let result = decode_by_kid::<Claims>(
+///     token,
+///     |kid| kid.and_then(|kid| keys.get(kid)),
+///     &Validation::default(),
+/// );
+/// ```
+pub fn decode_by_kid<'a, T: DeserializeOwned>(
+    token: impl AsRef<[u8]>,
+    key_for_kid: impl FnOnce(Option<&str>) -> Option<&'a DecodingKey>,
+    validation: &Validation,
+) -> Result<TokenData<T>> {
+    let token = token.as_ref();
+    let (signature, message) = expect_two!(token.rsplitn(2, |b| *b == b'.'));
+    let (payload, header) = expect_two!(message.rsplitn(2, |b| *b == b'.'));
+    let header = Header::from_encoded(header)?;
+    let key =
+        key_for_kid(header.kid.as_deref()).ok_or_else(|| new_error(ErrorKind::InvalidToken))?;
 
     if !validation.algorithms.contains(&header.alg) {
         return Err(new_error(ErrorKind::InvalidAlgorithm));

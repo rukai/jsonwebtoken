@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use jsonwebtoken::Extras;
 use jsonwebtoken::dangerous::insecure_decode;
 use serde::{Deserialize, Serialize};
@@ -9,7 +11,7 @@ use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{
     Algorithm, DecodingKey, EncodingKey, Header, Validation,
     crypto::{sign, verify},
-    decode, decode_header, encode,
+    decode, decode_by_kid, decode_header, encode,
 };
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
@@ -57,6 +59,124 @@ fn encode_with_custom_header() {
     assert_eq!(my_claims, token_data.claims);
     assert_eq!("kid", token_data.header.kid.unwrap());
     assert!(token_data.header.extras.inner().is_empty());
+}
+
+#[test]
+#[wasm_bindgen_test]
+fn decode_by_kid_selects_matching_key() {
+    let claims = Claims {
+        sub: "b@b.com".to_string(),
+        company: "ACME".to_string(),
+        exp: OffsetDateTime::now_utc().unix_timestamp() + 10000,
+    };
+    let keys = HashMap::from([
+        ("old-key".to_string(), DecodingKey::from_secret(b"old-secret")),
+        ("new-key".to_string(), DecodingKey::from_secret(b"new-secret")),
+    ]);
+
+    for (kid, secret) in [("old-key", b"old-secret"), ("new-key", b"new-secret")] {
+        let header = Header { kid: Some(kid.to_string()), ..Default::default() };
+        let token = encode(&header, &claims, &EncodingKey::from_secret(secret)).unwrap();
+        let data = decode_by_kid::<Claims>(
+            token.as_bytes(),
+            |kid| kid.and_then(|kid| keys.get(kid)),
+            &Validation::default(),
+        )
+        .unwrap();
+        assert_eq!(data.claims, claims);
+        assert_eq!(data.header, header);
+    }
+}
+
+#[test]
+#[wasm_bindgen_test]
+fn decode_by_kid_rejects_missing_key() {
+    let claims = serde_json::json!({"exp": 2532524891u64});
+    let keys = HashMap::from([("known-key".to_string(), DecodingKey::from_secret(b"secret"))]);
+
+    for kid in [None, Some("unknown-key".to_string())] {
+        let header = Header { kid, ..Default::default() };
+        let token = encode(&header, &claims, &EncodingKey::from_secret(b"secret")).unwrap();
+        let error = decode_by_kid::<serde_json::Value>(
+            &token,
+            |kid| kid.and_then(|kid| keys.get(kid)),
+            &Validation::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.into_kind(), ErrorKind::InvalidToken);
+    }
+
+    let header = Header { kid: Some("known-key".to_string()), ..Default::default() };
+    let token = encode(&header, &claims, &EncodingKey::from_secret(b"secret")).unwrap();
+    let error =
+        decode_by_kid::<serde_json::Value>(&token, |_| None, &Validation::default()).unwrap_err();
+    assert_eq!(error.into_kind(), ErrorKind::InvalidToken);
+}
+
+#[test]
+#[wasm_bindgen_test]
+fn decode_by_kid_validates_signature_algorithm_and_claims() {
+    let header = Header { kid: Some("key".to_string()), ..Default::default() };
+    let key = DecodingKey::from_secret(b"secret");
+    let claims = serde_json::json!({"exp": 2532524891u64});
+    let token = encode(&header, &claims, &EncodingKey::from_secret(b"wrong-secret")).unwrap();
+    let error = decode_by_kid::<serde_json::Value>(&token, |_| Some(&key), &Validation::default())
+        .unwrap_err();
+    assert_eq!(error.into_kind(), ErrorKind::InvalidSignature);
+
+    let token = encode(&header, &claims, &EncodingKey::from_secret(b"secret")).unwrap();
+    let error = decode_by_kid::<serde_json::Value>(
+        &token,
+        |_| Some(&key),
+        &Validation::new(Algorithm::HS512),
+    )
+    .unwrap_err();
+    assert_eq!(error.into_kind(), ErrorKind::InvalidAlgorithm);
+
+    let expired_claims = serde_json::json!({"exp": 0});
+    let token = encode(&header, &expired_claims, &EncodingKey::from_secret(b"secret")).unwrap();
+    let error = decode_by_kid::<serde_json::Value>(&token, |_| Some(&key), &Validation::default())
+        .unwrap_err();
+    assert_eq!(error.into_kind(), ErrorKind::ExpiredSignature);
+}
+
+#[test]
+#[wasm_bindgen_test]
+fn decode_by_kid_propagates_header_errors() {
+    for token in ["invalid", "!.payload.signature", "e30.payload.signature"] {
+        let expected = decode_header(token).unwrap_err();
+        let error = decode_by_kid::<Claims>(
+            token,
+            |_| panic!("key lookup must not run for an invalid header"),
+            &Validation::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error, expected);
+    }
+}
+
+#[test]
+#[wasm_bindgen_test]
+fn decode_by_kid_uses_default_key_without_kid() {
+    let claims = serde_json::json!({"exp": 2532524891u64});
+    let token = encode(&Header::default(), &claims, &EncodingKey::from_secret(b"secret")).unwrap();
+    let key = DecodingKey::from_secret(b"secret");
+    let captured = String::from("consumed by FnOnce");
+    let mut calls = 0;
+    let data = decode_by_kid::<serde_json::Value>(
+        &token,
+        |kid| {
+            drop(captured);
+            calls += 1;
+            assert_eq!(kid, None);
+            Some(&key)
+        },
+        &Validation::default(),
+    )
+    .unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(data.claims, claims);
+    assert_eq!(data.header.kid, None);
 }
 
 #[test]
